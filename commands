@@ -1,0 +1,52 @@
+# ── Trainers ───────────────────────────────────────────────────────────────────
+
+curl -s -X POST http://localhost:5000/trainers \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Ash", "hometown": "Pallet Town", "badge_count": 8}'
+
+curl -s -X POST http://localhost:5000/trainers \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Misty", "hometown": "Cerulean City", "badge_count": 1}'
+
+curl -s -X POST http://localhost:5000/trainers \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Brock", "hometown": "Pewter City", "badge_count": 1}'
+
+# ── Caught Pokémon (trainer 1 = Ash) ──────────────────────────────────────────
+
+curl -s -X POST http://localhost:5000/trainers/1/caught \
+  -H "Content-Type: application/json" \
+  -d '{"pokemon_id": 25, "nickname": "Pikachu"}'
+
+curl -s -X POST http://localhost:5000/trainers/1/caught \
+  -H "Content-Type: application/json" \
+  -d '{"pokemon_id": 6, "nickname": "Charizard"}'
+
+curl -s -X POST http://localhost:5000/trainers/1/caught \
+  -H "Content-Type: application/json" \
+  -d '{"pokemon_id": 143, "nickname": "Snorlax"}'
+
+# ── Caught Pokémon (trainer 2 = Misty) ────────────────────────────────────────
+
+curl -s -X POST http://localhost:5000/trainers/2/caught \
+  -H "Content-Type: application/json" \
+  -d '{"pokemon_id": 121, "nickname": "Starmie"}'
+
+curl -s -X POST http://localhost:5000/trainers/2/caught \
+  -H "Content-Type: application/json" \
+  -d '{"pokemon_id": 54, "nickname": "Psyduck"}'
+
+# ── Caught Pokémon (trainer 3 = Brock) ────────────────────────────────────────
+
+curl -s -X POST http://localhost:5000/trainers/3/caught \
+  -H "Content-Type: application/json" \
+  -d '{"pokemon_id": 74, "nickname": "Geodude"}'
+
+curl -s -X POST http://localhost:5000/trainers/3/caught \
+  -H "Content-Type: application/json" \
+  -d '{"pokemon_id": 95, "nickname": "Onix"}'
+
+# ── Verify ─────────────────────────────────────────────────────────────────────
+
+curl -s http://localhost:5000/trainers | python3 -m json.tool
+curl -s http://localhost:5000/trainers/1/caught | python3 -m json.tool
