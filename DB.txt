@@ -1,587 +1,120 @@
-# ============================================================
-# backend/routers/data.py
-# ============================================================
-"""
-Data router — read-only endpoints for every registered table.
-"""
-from __future__ import annotations
+import { useEffect, useState } from 'react';
+import { AlertCircle, Loader2, Moon, RefreshCw, Sun } from 'lucide-react';
+import { fetchTables } from '@/api/client';
+import Sidebar from '@/components/Sidebar';
+import TableView from '@/components/TableView';
+import { useTheme } from '@/hooks/useTheme';
+import { TableMeta } from '@/types';
 
-import math
-import sqlite3
-from typing import Any, Dict, List, Optional
-
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
-
-from auth import require_api_key
-from config import settings
-from database import get_connection
-from registry import TABLE_REGISTRY, get_table_entry
-
-router = APIRouter(prefix="", tags=["data"], dependencies=[Depends(require_api_key)])
-
-
-def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
-    return dict(row)
-
-def _get_columns(conn: sqlite3.Connection, table: str) -> List[str]:
-    cur = conn.execute(f"PRAGMA table_info({table})")
-    return [r["name"] for r in cur.fetchall()]
-
-def _resolve_cols(entry: dict, key: str, all_cols: List[str]) -> List[str]:
-    val = entry.get(key)
-    return all_cols if val is None else val
-
-def _latest_date(conn: sqlite3.Connection, table: str, all_cols: List[str]) -> Optional[str]:
-    """
-    Returns the MAX value of the 'dqs-date' column as YYYY-MM-DD,
-    or None if the column does not exist in this table.
-    """
-    if "dqs-date" not in all_cols:
-        return None
-    try:
-        row = conn.execute('SELECT MAX("dqs-date") as m FROM ' + table).fetchone()
-        val = row["m"] if row else None
-        if val and isinstance(val, str) and len(val) >= 10:
-            return val[:10]
-    except Exception:
-        pass
-    return None
-
-def _count(conn: sqlite3.Connection, table: str, where: str, params: list) -> int:
-    sql = f"SELECT COUNT(*) as n FROM {table}"
-    if where:
-        sql += f" WHERE {where}"
-    row = conn.execute(sql, params).fetchone()
-    return row["n"] if row else 0
-
-def _safe_sort(sort_by: Optional[str], sort_dir: str, default: str, all_cols: List[str]) -> str:
-    col = sort_by if sort_by in all_cols else default
-    direction = "DESC" if sort_dir.upper() == "DESC" else "ASC"
-    return f"{col} {direction}"
-
-def _build_where(searchable_cols, filterable_cols, filters, search):
-    conditions: List[str] = []
-    params: List[Any] = []
-    if search and searchable_cols:
-        like_parts = [f"LOWER(CAST({c} AS TEXT)) LIKE ?" for c in searchable_cols]
-        conditions.append(f"({' OR '.join(like_parts)})")
-        params.extend([f"%{search.lower()}%"] * len(searchable_cols))
-    for col, val in filters.items():
-        if col in filterable_cols:
-            conditions.append(f"{col} = ?")
-            params.append(val)
-    return " AND ".join(conditions), params
-
-def _query_page(conn, table, where, params, order_by, page, page_size):
-    total = _count(conn, table, where, params)
-    pages = math.ceil(total / page_size) if page_size else 1
-    offset = (page - 1) * page_size
-    sql = f"SELECT * FROM {table}"
-    if where:
-        sql += f" WHERE {where}"
-    sql += f" ORDER BY {order_by} LIMIT ? OFFSET ?"
-    rows = conn.execute(sql, params + [page_size, offset]).fetchall()
-    return total, pages, [_row_to_dict(r) for r in rows]
-
-def _latest_date_filtered(conn, table: str, all_cols: List[str], where: str, params: list) -> Optional[str]:
-    """MAX of dqs-date column within the current filter/search scope."""
-    if "dqs-date" not in all_cols:
-        return None
-    try:
-        sql = 'SELECT MAX("dqs-date") as m FROM ' + table
-        if where:
-            sql += f" WHERE {where}"
-        row = conn.execute(sql, params).fetchone()
-        val = row["m"] if row else None
-        if val and isinstance(val, str) and len(val) >= 10:
-            return val[:10]
-    except Exception:
-        pass
-    return None
-
-
-@router.get("/tables", summary="List available tables")
-def list_tables():
-    result = []
-    for name, entry in TABLE_REGISTRY.items():
-        db_key = entry.get("db", "default")
-        conn = get_connection(db_key)
-        try:
-            all_cols   = _get_columns(conn, name)
-            count      = _count(conn, name, "", [])
-            latest     = _latest_date(conn, name, all_cols)
-            searchable = _resolve_cols(entry, "searchable_cols", all_cols)
-            filterable = _resolve_cols(entry, "filterable_cols", all_cols)
-        finally:
-            conn.close()
-        result.append({
-            "name": name, "db": db_key, "row_count": count,
-            "latest_date": latest, "columns": all_cols,
-            "searchable_columns": searchable, "filterable_columns": filterable,
-        })
-    return result
-
-
-@router.get("/{table}", summary="Get all rows from a table")
-def get_table(
-    table: str,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(settings.DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE),
-    sort_by: Optional[str] = Query(None),
-    sort_dir: str = Query("asc"),
-    request: Request = None,
-):
-    try:
-        entry = get_table_entry(table)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Table '{table}' not found.")
-    conn = get_connection(entry.get("db", "default"))
-    try:
-        all_cols   = _get_columns(conn, table)
-        filterable = _resolve_cols(entry, "filterable_cols", all_cols)
-        searchable = _resolve_cols(entry, "searchable_cols", all_cols)
-        reserved   = {"page", "page_size", "sort_by", "sort_dir"}
-        filters    = {k: v for k, v in (request.query_params.items() if request else {})
-                      if k in filterable and k not in reserved}
-        order_by   = _safe_sort(sort_by, sort_dir, entry.get("default_sort", "id"), all_cols)
-        where, params = _build_where(searchable, filterable, filters, None)
-        total, pages, items = _query_page(conn, table, where, params, order_by, page, page_size)
-        latest = _latest_date_filtered(conn, table, all_cols, where, params)
-    finally:
-        conn.close()
-    return {"total": total, "page": page, "page_size": page_size, "pages": pages, "latest_date": latest, "items": items}
-
-
-@router.get("/{table}/search", summary="Search / filter a table")
-def search_table(
-    table: str,
-    q: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(settings.DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE),
-    sort_by: Optional[str] = Query(None),
-    sort_dir: str = Query("asc"),
-    request: Request = None,
-):
-    try:
-        entry = get_table_entry(table)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Table '{table}' not found.")
-    conn = get_connection(entry.get("db", "default"))
-    try:
-        all_cols   = _get_columns(conn, table)
-        filterable = _resolve_cols(entry, "filterable_cols", all_cols)
-        searchable = _resolve_cols(entry, "searchable_cols", all_cols)
-        reserved   = {"page", "page_size", "sort_by", "sort_dir", "q"}
-        filters    = {k: v for k, v in (request.query_params.items() if request else {})
-                      if k in filterable and k not in reserved}
-        order_by   = _safe_sort(sort_by, sort_dir, entry.get("default_sort", "id"), all_cols)
-        where, params = _build_where(searchable, filterable, filters, q)
-        total, pages, items = _query_page(conn, table, where, params, order_by, page, page_size)
-        latest = _latest_date_filtered(conn, table, all_cols, where, params)
-    finally:
-        conn.close()
-    return {"total": total, "page": page, "page_size": page_size, "pages": pages, "latest_date": latest, "items": items}
-
-
-@router.get("/{table}/{id}", summary="Get a single row by ID")
-def get_row(table: str, id: int):
-    try:
-        entry = get_table_entry(table)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Table '{table}' not found.")
-    conn = get_connection(entry.get("db", "default"))
-    try:
-        row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", [id]).fetchone()
-    finally:
-        conn.close()
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"Row {id} not found in '{table}'.")
-    return _row_to_dict(row)
-
-
-@router.get("/{table}/values/{column}", summary="Get distinct values for a column")
-def get_column_values(
-    table: str,
-    column: str,
-    q: Optional[str] = Query(None),
-    limit: int = Query(100, ge=1, le=500),
-):
-    try:
-        entry = get_table_entry(table)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Table '{table}' not found.")
-    conn = get_connection(entry.get("db", "default"))
-    try:
-        all_cols = _get_columns(conn, table)
-        if column not in all_cols:
-            raise HTTPException(status_code=400, detail=f"Column '{column}' not found in '{table}'.")
-        params: List[Any] = []
-        where = f'"{column}" IS NOT NULL AND CAST("{column}" AS TEXT) != \'\''
-        if q:
-            where += f' AND LOWER(CAST("{column}" AS TEXT)) LIKE ?'
-            params.append(f"%{q.lower()}%")
-        sql = f'SELECT DISTINCT "{column}" FROM {table} WHERE {where} ORDER BY "{column}" LIMIT ?'
-        params.append(limit)
-        rows = conn.execute(sql, params).fetchall()
-        values = [str(r[0]) for r in rows if r[0] is not None]
-    finally:
-        conn.close()
-    return {"column": column, "values": values}
-
-
-# ============================================================
-# frontend/src/types.ts
-# ============================================================
-export interface TableMeta {
-  name: string;
-  db: string;
-  row_count: number;
-  latest_date: string | null;
-  columns: string[];
-  searchable_columns: string[];
-  filterable_columns: string[];
+interface DashboardProps {
+  onLogout: () => void;
 }
 
-export interface PagedResponse<T = Record<string, unknown>> {
-  total: number;
-  page: number;
-  page_size: number;
-  pages: number;
-  latest_date?: string | null;
-  items: T[];
-}
+export default function Dashboard({ onLogout }: DashboardProps) {
+  const { theme, toggle } = useTheme();
+  const [tables, setTables] = useState<TableMeta[]>([]);
+  const [selectedTable, setSelectedTable] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [toast, setToast] = useState('');
 
-export type Theme = 'light' | 'dark';
-
-
-# ============================================================
-# frontend/src/components/TableView.tsx
-# ============================================================
-import { useCallback, useEffect, useRef, useState } from 'react';
-import {
-  ArrowUpDown, ChevronDown, ChevronLeft, ChevronRight,
-  ChevronsLeft, ChevronsRight, ChevronUp, Download,
-  Filter, Loader2, Search, SlidersHorizontal, X,
-} from 'lucide-react';
-import { fetchAllRows, fetchRows, searchRows } from '@/api/client';
-import { exportToXlsx } from '@/api/export';
-import { PagedResponse, TableMeta } from '@/types';
-import FilterInput from '@/components/FilterInput';
-
-interface TableViewProps {
-  table: TableMeta;
-}
-
-interface FilterState {
-  [col: string]: string;
-}
-
-type SortDir = 'asc' | 'desc';
-
-const PAGE_SIZE = 50;
-const DEBOUNCE_MS = 350;
-
-export default function TableView({ table }: TableViewProps) {
-  const [data, setData]               = useState<PagedResponse | null>(null);
-  const [loading, setLoading]         = useState(false);
-  const [exporting, setExporting]     = useState(false);
-  const [error, setError]             = useState('');
-  const [searchTerm, setSearchTerm]   = useState('');
-  const [page, setPage]               = useState(1);
-  const [sortBy, setSortBy]           = useState<string | null>(null);
-  const [sortDir, setSortDir]         = useState<SortDir>('asc');
-  const [filters, setFilters]         = useState<FilterState>({});
-  const [showFilters, setShowFilters] = useState(false);
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const filterableCols = table.filterable_columns ?? [];
-  const hasSearch  = table.searchable_columns.length > 0;
-  const hasFilters = filterableCols.length > 0;
-
-  function buildParams(pg: number): Record<string, string | number> {
-    const params: Record<string, string | number> = { page: pg, page_size: PAGE_SIZE };
-    if (searchTerm) params.q = searchTerm;
-    if (sortBy) { params.sort_by = sortBy; params.sort_dir = sortDir; }
-    Object.entries(filters).forEach(([k, v]) => { if (v.trim()) params[k] = v.trim(); });
-    return params;
-  }
-
-  const load = useCallback(async (pg: number) => {
+  async function loadTables(showToast = false) {
     setLoading(true);
     setError('');
+    if (showToast) setToast('Refreshing…');
     try {
-      const params = buildParams(pg);
-      const result = searchTerm
-        ? await searchRows(table.name, params)
-        : await fetchRows(table.name, params);
-      setData(result);
-    } catch (e: unknown) {
-      setError((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'Failed to load data.');
+      const data = await fetchTables();
+      setTables(data);
+      if (data.length > 0 && !selectedTable) {
+        setSelectedTable(data[0].name);
+      }
+    } catch {
+      setError('Failed to load tables. The API may be unavailable.');
     } finally {
       setLoading(false);
+      if (showToast) {
+        setToast('Tables refreshed');
+        setTimeout(() => setToast(''), 2500);
+      }
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [table.name, searchTerm, sortBy, sortDir, filters]);
+  }
 
   useEffect(() => {
-    setSearchTerm(''); setPage(1); setData(null);
-    setSortBy(null); setSortDir('asc'); setFilters({});
-    setShowFilters(false);
-  }, [table.name]);
+    loadTables();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => {
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => { setPage(1); load(1); }, DEBOUNCE_MS);
-    return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchTerm, sortBy, sortDir, filters, table.name]);
-
-  function handlePageChange(pg: number) { setPage(pg); load(pg); }
-
-  function handleSort(col: string) {
-    if (sortBy === col) { setSortDir((d) => (d === 'asc' ? 'desc' : 'asc')); }
-    else { setSortBy(col); setSortDir('asc'); }
-  }
-
-  function handleFilterChange(col: string, val: string) {
-    setFilters((prev) => ({ ...prev, [col]: val }));
-  }
-
-  function clearFilters() { setFilters({}); }
-
-  const activeFilterCount = Object.values(filters).filter((v) => v.trim()).length;
-
-  async function handleExport() {
-    setExporting(true);
-    try {
-      const rows = await fetchAllRows(table.name, searchTerm || undefined);
-      exportToXlsx(rows, table.name);
-    } catch { setError('Export failed.'); }
-    finally { setExporting(false); }
-  }
-
-  const columns = data?.items[0] ? Object.keys(data.items[0]) : table.columns;
+  const currentTable = tables.find((t) => t.name === selectedTable) ?? null;
 
   return (
-    <div className="flex flex-col h-full min-w-0">
+    <div className="flex h-screen bg-gray-50 dark:bg-gray-950 overflow-hidden">
+      <Sidebar
+        tables={tables}
+        selectedTable={selectedTable}
+        onSelectTable={setSelectedTable}
+        onLogout={onLogout}
+        endpoint={import.meta.env.VITE_API_ENDPOINT}
+      />
 
-      {/* Toolbar */}
-      <div className="flex items-center gap-2 px-6 py-3 border-b border-gray-100 dark:border-gray-800 shrink-0 flex-wrap">
-        <div className="flex-1 min-w-0 mr-2">
-          <h2 className="text-base font-semibold text-gray-900 dark:text-white tracking-tight truncate">{table.name}</h2>
-          <p className="text-xs text-gray-400 dark:text-gray-600 font-mono mt-0.5 flex items-center gap-2">
-            <span>
-              {data
-                ? `${data.total.toLocaleString()} rows${searchTerm ? ` matching "${searchTerm}"` : ''}`
-                : `${table.row_count.toLocaleString()} rows`}
-            </span>
-            {(data?.latest_date ?? table.latest_date) && (
-              <>
-                <span className="text-gray-200 dark:text-gray-700">·</span>
-                <span>latest <span className="text-gray-500 dark:text-gray-400">{data?.latest_date ?? table.latest_date}</span></span>
-              </>
-            )}
-          </p>
-        </div>
-
-        {hasSearch && (
-          <div className="relative w-56">
-            <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 dark:text-gray-600 pointer-events-none" />
-            <input
-              type="search"
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              placeholder="Search…"
-              className="w-full pl-8 pr-7 py-1.5 text-sm rounded-lg border border-gray-200 dark:border-gray-700
-                         bg-gray-50 dark:bg-gray-800 text-gray-900 dark:text-white
-                         placeholder-gray-400 dark:placeholder-gray-600
-                         focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent transition-shadow"
-            />
-            {searchTerm && (
-              <button onClick={() => setSearchTerm('')}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
-                <X size={12} />
-              </button>
-            )}
-          </div>
-        )}
-
-        {hasFilters && (
+      <main className="flex-1 flex flex-col overflow-hidden bg-white dark:bg-gray-950">
+        <div className="flex items-center justify-end gap-2 px-5 py-3
+                        border-b border-gray-100 dark:border-gray-800 shrink-0">
           <button
-            onClick={() => setShowFilters((s) => !s)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-lg border transition-colors
-                        ${showFilters || activeFilterCount > 0
-                          ? 'border-brand-300 dark:border-brand-700 bg-brand-50 dark:bg-brand-900/30 text-brand-700 dark:text-brand-300'
-                          : 'border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800'}`}
+            onClick={() => loadTables(true)}
+            disabled={loading}
+            aria-label="Refresh tables"
+            className="p-2 rounded-lg text-gray-400 dark:text-gray-600
+                       hover:bg-gray-100 dark:hover:bg-gray-800 hover:text-gray-700 dark:hover:text-gray-300
+                       disabled:opacity-40 transition-colors"
           >
-            <SlidersHorizontal size={13} />
-            Filters
-            {activeFilterCount > 0 && (
-              <span className="ml-0.5 inline-flex items-center justify-center w-4 h-4 rounded-full bg-brand-600 text-white text-[10px] font-bold">
-                {activeFilterCount}
-              </span>
-            )}
-            {showFilters ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+            <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
           </button>
-        )}
-
-        <button
-          onClick={handleExport}
-          disabled={exporting || loading || !data?.items.length}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-lg
-                     border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400
-                     hover:bg-gray-50 dark:hover:bg-gray-800 hover:text-gray-900 dark:hover:text-white
-                     disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-        >
-          {exporting ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
-          Export .xlsx
-        </button>
-      </div>
-
-      {/* Filter panel */}
-      {showFilters && hasFilters && (
-        <div className="px-6 py-3 border-b border-gray-100 dark:border-gray-800 bg-gray-50/60 dark:bg-gray-900/40 shrink-0">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
-              <Filter size={11} /> Column Filters
-            </span>
-            {activeFilterCount > 0 && (
-              <button onClick={clearFilters}
-                className="text-xs text-red-500 dark:text-red-400 hover:underline flex items-center gap-1">
-                <X size={11} /> Clear all
-              </button>
-            )}
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {filterableCols.map((col) => (
-              <div key={col} className="flex flex-col gap-1">
-                <label className="text-[10px] font-mono font-medium text-gray-400 dark:text-gray-600 uppercase tracking-wider">
-                  {col}
-                </label>
-                <FilterInput
-                  table={table.name}
-                  column={col}
-                  value={filters[col] ?? ''}
-                  onChange={(val) => handleFilterChange(col, val)}
-                />
-              </div>
-            ))}
-          </div>
+          <button
+            onClick={toggle}
+            aria-label="Toggle theme"
+            className="p-2 rounded-lg text-gray-400 dark:text-gray-600
+                       hover:bg-gray-100 dark:hover:bg-gray-800 hover:text-gray-700 dark:hover:text-gray-300
+                       transition-colors"
+          >
+            {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
+          </button>
         </div>
-      )}
 
-      {error && (
-        <div className="mx-6 mt-3 px-4 py-3 rounded-lg bg-red-50 dark:bg-red-950/40
-                        border border-red-200 dark:border-red-800 text-sm text-red-600 dark:text-red-400 shrink-0">
-          {error}
-        </div>
-      )}
-
-      {/* Table */}
-      <div className="flex-1 overflow-auto px-6 py-4">
-        {loading && !data ? (
-          <div className="flex items-center justify-center h-40 gap-2 text-gray-400 dark:text-gray-600">
-            <Loader2 size={18} className="animate-spin" /><span className="text-sm">Loading…</span>
-          </div>
-        ) : data?.items.length === 0 ? (
-          <div className="flex items-center justify-center h-40 text-sm text-gray-400 dark:text-gray-600">
-            No results{searchTerm ? ` for "${searchTerm}"` : ''}.
-          </div>
-        ) : (
-          <div className="relative rounded-xl border border-gray-100 dark:border-gray-800 shadow-sm">
-            {loading && (
-              <div className="absolute inset-0 bg-white/60 dark:bg-gray-950/60 z-10 flex items-center justify-center rounded-xl">
-                <Loader2 size={20} className="animate-spin text-brand-500" />
-              </div>
-            )}
-            <div className="overflow-x-auto">
-              <table className="w-max min-w-full text-sm border-collapse">
-                <thead>
-                  <tr className="bg-gray-50 dark:bg-gray-800/60">
-                    {columns.map((col) => {
-                      const isSorted = sortBy === col;
-                      return (
-                        <th key={col} onClick={() => handleSort(col)}
-                          className="text-left px-4 py-3 text-xs font-semibold text-gray-500 dark:text-gray-400
-                                     uppercase tracking-wider whitespace-nowrap border-b border-gray-100 dark:border-gray-800
-                                     font-mono cursor-pointer select-none
-                                     hover:bg-gray-100 dark:hover:bg-gray-700/60 hover:text-gray-700 dark:hover:text-gray-200
-                                     transition-colors group">
-                          <span className="flex items-center gap-1.5">
-                            {col}
-                            {isSorted
-                              ? sortDir === 'asc' ? <ChevronUp size={12} className="text-brand-500" /> : <ChevronDown size={12} className="text-brand-500" />
-                              : <ArrowUpDown size={11} className="text-gray-300 dark:text-gray-700 group-hover:text-gray-400 dark:group-hover:text-gray-500" />}
-                          </span>
-                        </th>
-                      );
-                    })}
-                  </tr>
-                </thead>
-                <tbody>
-                  {(data?.items ?? []).map((row, i) => (
-                    <tr key={i} className="border-b border-gray-50 dark:border-gray-800/60 hover:bg-brand-50/50 dark:hover:bg-brand-900/10 transition-colors">
-                      {columns.map((col) => {
-                        const val = (row as Record<string, unknown>)[col];
-                        return (
-                          <td key={col} className="px-4 py-2.5 text-gray-700 dark:text-gray-300 whitespace-nowrap">
-                            {val === null || val === undefined ? (
-                              <span className="text-gray-300 dark:text-gray-700 font-mono text-xs">null</span>
-                            ) : typeof val === 'boolean' ? (
-                              <span className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium
-                                ${val ? 'bg-green-50 text-green-700 dark:bg-green-900/30 dark:text-green-400'
-                                      : 'bg-red-50 text-red-600 dark:bg-red-900/30 dark:text-red-400'}`}>
-                                {val ? 'true' : 'false'}
-                              </span>
-                            ) : typeof val === 'number' ? (
-                              <span className="font-mono text-brand-600 dark:text-brand-400">{val.toLocaleString()}</span>
-                            ) : String(val).match(/^\d{4}-\d{2}-\d{2}/) ? (
-                              <span className="text-gray-500 dark:text-gray-500 font-mono text-xs">
-                                {String(val).slice(0, 19).replace('T', ' ')}
-                              </span>
-                            ) : (
-                              <span className="max-w-xs block truncate" title={String(val)}>{String(val)}</span>
-                            )}
-                          </td>
-                        );
-                      })}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+        <div className="flex-1 overflow-hidden">
+          {loading && tables.length === 0 ? (
+            <div className="flex items-center justify-center h-full gap-2 text-gray-400 dark:text-gray-600">
+              <Loader2 size={20} className="animate-spin" />
+              <span className="text-sm">Loading tables…</span>
             </div>
-          </div>
-        )}
-      </div>
-
-      {/* Pagination */}
-      {data && data.pages > 1 && (
-        <div className="flex items-center justify-between px-6 py-3 border-t border-gray-100 dark:border-gray-800 shrink-0">
-          <span className="text-xs text-gray-400 dark:text-gray-600">
-            Page {data.page} of {data.pages} — {data.total.toLocaleString()} rows
-          </span>
-          <div className="flex items-center gap-1">
-            <PagBtn onClick={() => handlePageChange(1)} disabled={page === 1} label="First"><ChevronsLeft size={14} /></PagBtn>
-            <PagBtn onClick={() => handlePageChange(page - 1)} disabled={page === 1} label="Prev"><ChevronLeft size={14} /></PagBtn>
-            <span className="px-3 py-1 text-xs font-mono text-gray-600 dark:text-gray-400">{page}</span>
-            <PagBtn onClick={() => handlePageChange(page + 1)} disabled={page >= data.pages} label="Next"><ChevronRight size={14} /></PagBtn>
-            <PagBtn onClick={() => handlePageChange(data.pages)} disabled={page >= data.pages} label="Last"><ChevronsRight size={14} /></PagBtn>
-          </div>
+          ) : error ? (
+            <div className="flex flex-col items-center justify-center h-full gap-3 text-center p-8">
+              <AlertCircle size={32} className="text-red-400" />
+              <p className="text-sm text-red-600 dark:text-red-400 max-w-sm">{error}</p>
+              <button onClick={loadTables} className="text-sm text-brand-600 dark:text-brand-400 hover:underline">
+                Try again
+              </button>
+            </div>
+          ) : tables.length === 0 ? (
+            <div className="flex items-center justify-center h-full text-sm text-gray-400 dark:text-gray-600">
+              No tables found.
+            </div>
+          ) : currentTable ? (
+            <TableView table={currentTable} />
+          ) : (
+            <div className="flex items-center justify-center h-full text-sm text-gray-400 dark:text-gray-600">
+              Select a table from the sidebar.
+            </div>
+          )}
+        </div>
+      {/* Toast */}
+      {toast && (
+        <div className="fixed bottom-5 left-1/2 -translate-x-1/2 px-4 py-2 rounded-lg
+                        bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900
+                        text-sm font-medium shadow-lg shadow-black/20
+                        animate-pulse pointer-events-none z-50">
+          {toast}
         </div>
       )}
+      </main>
     </div>
-  );
-}
-
-function PagBtn({ children, onClick, disabled, label }: {
-  children: React.ReactNode; onClick: () => void; disabled: boolean; label: string;
-}) {
-  return (
-    <button onClick={onClick} disabled={disabled} aria-label={label}
-      className="p-1.5 rounded text-gray-400 dark:text-gray-600
-                 hover:bg-gray-100 dark:hover:bg-gray-800 hover:text-gray-700 dark:hover:text-gray-300
-                 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
-      {children}
-    </button>
   );
 }
