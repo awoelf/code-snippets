@@ -1,120 +1,265 @@
-import { useEffect, useState } from 'react';
-import { AlertCircle, Loader2, Moon, RefreshCw, Sun } from 'lucide-react';
-import { fetchTables } from '@/api/client';
-import Sidebar from '@/components/Sidebar';
-import TableView from '@/components/TableView';
-import { useTheme } from '@/hooks/useTheme';
-import { TableMeta } from '@/types';
+"""
+Data router — read-only endpoints for every registered table.
+"""
+from __future__ import annotations
 
-interface DashboardProps {
-  onLogout: () => void;
-}
+import math
+import sqlite3
+from typing import Any, Dict, List, Optional
 
-export default function Dashboard({ onLogout }: DashboardProps) {
-  const { theme, toggle } = useTheme();
-  const [tables, setTables] = useState<TableMeta[]>([]);
-  const [selectedTable, setSelectedTable] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-  const [toast, setToast] = useState('');
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-  async function loadTables(showToast = false) {
-    setLoading(true);
-    setError('');
-    if (showToast) setToast('Refreshing…');
-    try {
-      const data = await fetchTables();
-      setTables(data);
-      if (data.length > 0 && !selectedTable) {
-        setSelectedTable(data[0].name);
-      }
-    } catch {
-      setError('Failed to load tables. The API may be unavailable.');
-    } finally {
-      setLoading(false);
-      if (showToast) {
-        setToast('Tables refreshed');
-        setTimeout(() => setToast(''), 2500);
-      }
-    }
-  }
+from auth import require_api_key
+from config import settings
+from database import get_connection
+from registry import TABLE_REGISTRY, get_table_entry
 
-  useEffect(() => {
-    loadTables();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+router = APIRouter(prefix="", tags=["data"], dependencies=[Depends(require_api_key)])
 
-  const currentTable = tables.find((t) => t.name === selectedTable) ?? null;
 
-  return (
-    <div className="flex h-screen bg-gray-50 dark:bg-gray-950 overflow-hidden">
-      <Sidebar
-        tables={tables}
-        selectedTable={selectedTable}
-        onSelectTable={setSelectedTable}
-        onLogout={onLogout}
-        endpoint={import.meta.env.VITE_API_ENDPOINT}
-      />
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-      <main className="flex-1 flex flex-col overflow-hidden bg-white dark:bg-gray-950">
-        <div className="flex items-center justify-end gap-2 px-5 py-3
-                        border-b border-gray-100 dark:border-gray-800 shrink-0">
-          <button
-            onClick={() => loadTables(true)}
-            disabled={loading}
-            aria-label="Refresh tables"
-            className="p-2 rounded-lg text-gray-400 dark:text-gray-600
-                       hover:bg-gray-100 dark:hover:bg-gray-800 hover:text-gray-700 dark:hover:text-gray-300
-                       disabled:opacity-40 transition-colors"
-          >
-            <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
-          </button>
-          <button
-            onClick={toggle}
-            aria-label="Toggle theme"
-            className="p-2 rounded-lg text-gray-400 dark:text-gray-600
-                       hover:bg-gray-100 dark:hover:bg-gray-800 hover:text-gray-700 dark:hover:text-gray-300
-                       transition-colors"
-          >
-            {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
-          </button>
-        </div>
+def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return dict(row)
 
-        <div className="flex-1 overflow-hidden">
-          {loading && tables.length === 0 ? (
-            <div className="flex items-center justify-center h-full gap-2 text-gray-400 dark:text-gray-600">
-              <Loader2 size={20} className="animate-spin" />
-              <span className="text-sm">Loading tables…</span>
-            </div>
-          ) : error ? (
-            <div className="flex flex-col items-center justify-center h-full gap-3 text-center p-8">
-              <AlertCircle size={32} className="text-red-400" />
-              <p className="text-sm text-red-600 dark:text-red-400 max-w-sm">{error}</p>
-              <button onClick={loadTables} className="text-sm text-brand-600 dark:text-brand-400 hover:underline">
-                Try again
-              </button>
-            </div>
-          ) : tables.length === 0 ? (
-            <div className="flex items-center justify-center h-full text-sm text-gray-400 dark:text-gray-600">
-              No tables found.
-            </div>
-          ) : currentTable ? (
-            <TableView table={currentTable} />
-          ) : (
-            <div className="flex items-center justify-center h-full text-sm text-gray-400 dark:text-gray-600">
-              Select a table from the sidebar.
-            </div>
-          )}
-        </div>
-      {/* Toast */}
-      {toast && (
-        <div className="fixed bottom-5 left-1/2 -translate-x-1/2 px-4 py-2 rounded-lg
-                        bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900
-                        text-sm font-medium shadow-lg shadow-black/20
-                        animate-pulse pointer-events-none z-50">
-          {toast}
-        </div>
-      )}
-      </main>
-    </div>
-  );
-}
+
+def _get_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return [r["name"] for r in cur.fetchall()]
+
+
+def _resolve_cols(entry: dict, key: str, all_cols: List[str]) -> List[str]:
+    val = entry.get(key)
+    return all_cols if val is None else val
+
+
+def _latest_date(conn: sqlite3.Connection, table: str, all_cols: List[str]) -> Optional[str]:
+    """
+    Returns the MAX value of the 'dqs-date' column as YYYY-MM-DD,
+    or None if the column does not exist in this table.
+    """
+    if "dqs-date" not in all_cols:
+        return None
+    try:
+        row = conn.execute('SELECT MAX("dqs-date") as m FROM ' + table).fetchone()
+        val = row["m"] if row else None
+        if val and isinstance(val, str) and len(val) >= 10:
+            return val[:10]
+    except Exception:
+        pass
+    return None
+
+def _count(conn: sqlite3.Connection, table: str, where: str, params: list) -> int:
+    sql = f"SELECT COUNT(*) as n FROM {table}"
+    if where:
+        sql += f" WHERE {where}"
+    row = conn.execute(sql, params).fetchone()
+    return row["n"] if row else 0
+
+
+def _safe_sort(sort_by: Optional[str], sort_dir: str, default: str, all_cols: List[str]) -> str:
+    col = sort_by if sort_by in all_cols else default
+    direction = "DESC" if sort_dir.upper() == "DESC" else "ASC"
+    return f'"{col}" {direction}'
+
+
+def _build_where(
+    searchable_cols: List[str],
+    filterable_cols: List[str],
+    filters: Dict[str, str],
+    search: Optional[str],
+) -> tuple[str, list]:
+    conditions: List[str] = []
+    params: List[Any] = []
+    if search and searchable_cols:
+        like_parts = [f"LOWER(CAST("{c}" AS TEXT)) LIKE ?" for c in searchable_cols]
+        conditions.append(f"({' OR '.join(like_parts)})")
+        params.extend([f"%{search.lower()}%"] * len(searchable_cols))
+    for col, val in filters.items():
+        if col in filterable_cols:
+            conditions.append(f'"{col}" = ?')
+            params.append(val)
+    return " AND ".join(conditions), params
+
+
+def _query_page(conn, table, where, params, order_by, page, page_size):
+    total = _count(conn, table, where, params)
+    pages = math.ceil(total / page_size) if page_size else 1
+    offset = (page - 1) * page_size
+    sql = f"SELECT * FROM {table}"
+    if where:
+        sql += f" WHERE {where}"
+    sql += f" ORDER BY {order_by} LIMIT ? OFFSET ?"
+    rows = conn.execute(sql, params + [page_size, offset]).fetchall()
+    return total, pages, [_row_to_dict(r) for r in rows]
+
+
+def _latest_date_filtered(conn, table: str, all_cols: List[str], where: str, params: list) -> Optional[str]:
+    """MAX of dqs-date column within the current filter/search scope."""
+    if "dqs-date" not in all_cols:
+        return None
+    try:
+        sql = 'SELECT MAX("dqs-date") as m FROM ' + table
+        if where:
+            sql += f" WHERE {where}"
+        row = conn.execute(sql, params).fetchone()
+        val = row["m"] if row else None
+        if val and isinstance(val, str) and len(val) >= 10:
+            return val[:10]
+    except Exception:
+        pass
+    return None
+
+
+# ── /api/tables ───────────────────────────────────────────────────────────────
+
+@router.get("/tables", summary="List available tables")
+def list_tables():
+    result = []
+    for name, entry in TABLE_REGISTRY.items():
+        db_key = entry.get("db", "default")
+        conn = get_connection(db_key)
+        try:
+            all_cols  = _get_columns(conn, name)
+            count     = _count(conn, name, "", [])
+            latest    = _latest_date(conn, name, all_cols)
+            searchable = _resolve_cols(entry, "searchable_cols", all_cols)
+            filterable = _resolve_cols(entry, "filterable_cols", all_cols)
+        finally:
+            conn.close()
+
+        result.append({
+            "name": name,
+            "db": db_key,
+            "row_count": count,
+            "latest_date": latest,
+            "columns": all_cols,
+            "searchable_columns": searchable,
+            "filterable_columns": filterable,
+        })
+    return result
+
+
+# ── /api/{table} ──────────────────────────────────────────────────────────────
+
+@router.get("/{table}", summary="Get all rows from a table")
+def get_table(
+    table: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(settings.DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE),
+    sort_by: Optional[str] = Query(None),
+    sort_dir: str = Query("asc"),
+    request: Request = None,
+):
+    try:
+        entry = get_table_entry(table)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Table '{table}' not found.")
+
+    conn = get_connection(entry.get("db", "default"))
+    try:
+        all_cols   = _get_columns(conn, table)
+        filterable = _resolve_cols(entry, "filterable_cols", all_cols)
+        searchable = _resolve_cols(entry, "searchable_cols", all_cols)
+        reserved   = {"page", "page_size", "sort_by", "sort_dir"}
+        filters    = {k: v for k, v in (request.query_params.items() if request else {})
+                      if k in filterable and k not in reserved}
+        order_by   = _safe_sort(sort_by, sort_dir, entry.get("default_sort", "id"), all_cols)
+        where, params = _build_where(searchable, filterable, filters, None)
+        total, pages, items = _query_page(conn, table, where, params, order_by, page, page_size)
+        latest = _latest_date_filtered(conn, table, all_cols, where, params)
+    finally:
+        conn.close()
+
+    return {"total": total, "page": page, "page_size": page_size, "pages": pages, "latest_date": latest, "items": items}
+
+
+# ── /api/{table}/search ───────────────────────────────────────────────────────
+
+@router.get("/{table}/search", summary="Search / filter a table")
+def search_table(
+    table: str,
+    q: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(settings.DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE),
+    sort_by: Optional[str] = Query(None),
+    sort_dir: str = Query("asc"),
+    request: Request = None,
+):
+    try:
+        entry = get_table_entry(table)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Table '{table}' not found.")
+
+    conn = get_connection(entry.get("db", "default"))
+    try:
+        all_cols   = _get_columns(conn, table)
+        filterable = _resolve_cols(entry, "filterable_cols", all_cols)
+        searchable = _resolve_cols(entry, "searchable_cols", all_cols)
+        reserved   = {"page", "page_size", "sort_by", "sort_dir", "q"}
+        filters    = {k: v for k, v in (request.query_params.items() if request else {})
+                      if k in filterable and k not in reserved}
+        order_by   = _safe_sort(sort_by, sort_dir, entry.get("default_sort", "id"), all_cols)
+        where, params = _build_where(searchable, filterable, filters, q)
+        total, pages, items = _query_page(conn, table, where, params, order_by, page, page_size)
+        latest = _latest_date_filtered(conn, table, all_cols, where, params)
+    finally:
+        conn.close()
+
+    return {"total": total, "page": page, "page_size": page_size, "pages": pages, "latest_date": latest, "items": items}
+
+
+# ── /api/{table}/{id} ─────────────────────────────────────────────────────────
+
+@router.get("/{table}/{id}", summary="Get a single row by ID")
+def get_row(table: str, id: int):
+    try:
+        entry = get_table_entry(table)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Table '{table}' not found.")
+
+    conn = get_connection(entry.get("db", "default"))
+    try:
+        row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", [id]).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Row {id} not found in '{table}'.")
+
+    return _row_to_dict(row)
+
+# ── /api/{table}/values/{column} ─────────────────────────────────────────────
+
+@router.get("/{table}/values/{column}", summary="Get distinct values for a column")
+def get_column_values(
+    table: str,
+    column: str,
+    q: Optional[str] = Query(None, description="Filter suggestions by partial match"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    try:
+        entry = get_table_entry(table)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Table '{table}' not found.")
+
+    conn = get_connection(entry.get("db", "default"))
+    try:
+        all_cols = _get_columns(conn, table)
+        if column not in all_cols:
+            raise HTTPException(status_code=400, detail=f"Column '{column}' not found in '{table}'.")
+
+        params: List[Any] = []
+        where = f"{column} IS NOT NULL AND CAST({column} AS TEXT) != ''"
+        if q:
+            where += f" AND LOWER(CAST({column} AS TEXT)) LIKE ?"
+            params.append(f"%{q.lower()}%")
+
+        sql = f"SELECT DISTINCT {column} FROM {table} WHERE {where} ORDER BY {column} LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
+        values = [str(r[0]) for r in rows if r[0] is not None]
+    finally:
+        conn.close()
+
+    return {"column": column, "values": values}
