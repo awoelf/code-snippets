@@ -83,6 +83,22 @@ def _query_page(conn, table, where, params, order_by, page, page_size):
     rows = conn.execute(sql, params + [page_size, offset]).fetchall()
     return total, pages, [_row_to_dict(r) for r in rows]
 
+def _latest_date_filtered(conn, table: str, all_cols: List[str], where: str, params: list) -> Optional[str]:
+    """MAX of dqs-date column within the current filter/search scope."""
+    if "dqs-date" not in all_cols:
+        return None
+    try:
+        sql = 'SELECT MAX("dqs-date") as m FROM ' + table
+        if where:
+            sql += f" WHERE {where}"
+        row = conn.execute(sql, params).fetchone()
+        val = row["m"] if row else None
+        if val and isinstance(val, str) and len(val) >= 10:
+            return val[:10]
+    except Exception:
+        pass
+    return None
+
 
 @router.get("/tables", summary="List available tables")
 def list_tables():
@@ -130,9 +146,10 @@ def get_table(
         order_by   = _safe_sort(sort_by, sort_dir, entry.get("default_sort", "id"), all_cols)
         where, params = _build_where(searchable, filterable, filters, None)
         total, pages, items = _query_page(conn, table, where, params, order_by, page, page_size)
+        latest = _latest_date_filtered(conn, table, all_cols, where, params)
     finally:
         conn.close()
-    return {"total": total, "page": page, "page_size": page_size, "pages": pages, "items": items}
+    return {"total": total, "page": page, "page_size": page_size, "pages": pages, "latest_date": latest, "items": items}
 
 
 @router.get("/{table}/search", summary="Search / filter a table")
@@ -160,9 +177,10 @@ def search_table(
         order_by   = _safe_sort(sort_by, sort_dir, entry.get("default_sort", "id"), all_cols)
         where, params = _build_where(searchable, filterable, filters, q)
         total, pages, items = _query_page(conn, table, where, params, order_by, page, page_size)
+        latest = _latest_date_filtered(conn, table, all_cols, where, params)
     finally:
         conn.close()
-    return {"total": total, "page": page, "page_size": page_size, "pages": pages, "items": items}
+    return {"total": total, "page": page, "page_size": page_size, "pages": pages, "latest_date": latest, "items": items}
 
 
 @router.get("/{table}/{id}", summary="Get a single row by ID")
@@ -229,211 +247,11 @@ export interface PagedResponse<T = Record<string, unknown>> {
   page: number;
   page_size: number;
   pages: number;
+  latest_date?: string | null;
   items: T[];
 }
 
 export type Theme = 'light' | 'dark';
-
-
-# ============================================================
-# frontend/src/api/client.ts
-# ============================================================
-import axios from 'axios';
-import { PagedResponse, TableMeta } from '@/types';
-
-const API_ENDPOINT = import.meta.env.VITE_API_ENDPOINT as string;
-const API_KEY      = import.meta.env.VITE_API_KEY as string;
-
-if (!API_ENDPOINT || !API_KEY) {
-  console.error('Missing VITE_API_ENDPOINT or VITE_API_KEY in .env');
-}
-
-const client = axios.create({
-  baseURL: API_ENDPOINT.replace(/\/$/, ''),
-  headers: { 'X-API-Key': API_KEY },
-  timeout: 15_000,
-});
-
-const AUTH_KEY = 'data_explorer_auth';
-
-export function saveAuth(): void { sessionStorage.setItem(AUTH_KEY, 'true'); }
-export function isAuthenticated(): boolean { return sessionStorage.getItem(AUTH_KEY) === 'true'; }
-export function clearAuth(): void { sessionStorage.removeItem(AUTH_KEY); }
-
-export function checkLoginPassword(input: string): boolean {
-  const expected = import.meta.env.VITE_LOGIN_PASSWORD as string;
-  return input === expected;
-}
-
-export async function validateConnection(): Promise<void> {
-  await client.get('/health');
-  await client.get('/api/tables');
-}
-
-export async function fetchTables(): Promise<TableMeta[]> {
-  const { data } = await client.get<TableMeta[]>('/api/tables');
-  return data;
-}
-
-export async function fetchRows(
-  table: string,
-  params: Record<string, string | number>,
-): Promise<PagedResponse> {
-  const { data } = await client.get<PagedResponse>(`/api/${table}`, { params });
-  return data;
-}
-
-export async function searchRows(
-  table: string,
-  params: Record<string, string | number>,
-): Promise<PagedResponse> {
-  const { data } = await client.get<PagedResponse>(`/api/${table}/search`, { params });
-  return data;
-}
-
-export async function fetchAllRows(
-  table: string,
-  searchTerm?: string,
-): Promise<Record<string, unknown>[]> {
-  const MAX = 1000;
-  const params: Record<string, string | number> = { page: 1, page_size: MAX };
-  if (searchTerm) params.q = searchTerm;
-  const fn = searchTerm ? searchRows : fetchRows;
-  const first = await fn(table, params);
-  const items = [...first.items];
-  if (first.pages > 1) {
-    const rest = await Promise.all(
-      Array.from({ length: first.pages - 1 }, (_, i) => fn(table, { ...params, page: i + 2 })),
-    );
-    rest.forEach((r) => items.push(...r.items));
-  }
-  return items;
-}
-
-export async function fetchColumnValues(
-  table: string,
-  column: string,
-  q?: string,
-): Promise<string[]> {
-  const params: Record<string, string> = {};
-  if (q) params.q = q;
-  const { data } = await client.get<{ column: string; values: string[] }>(
-    `/api/${table}/values/${column}`,
-    { params },
-  );
-  return data.values;
-}
-
-
-# ============================================================
-# frontend/src/components/FilterInput.tsx
-# ============================================================
-import { useEffect, useRef, useState } from 'react';
-import { Loader2, X } from 'lucide-react';
-import { fetchColumnValues } from '@/api/client';
-
-interface FilterInputProps {
-  table: string;
-  column: string;
-  value: string;
-  onChange: (val: string) => void;
-}
-
-export default function FilterInput({ table, column, value, onChange }: FilterInputProps) {
-  const [suggestions, setSuggestions] = useState<string[]>([]);
-  const [loading, setLoading]         = useState(false);
-  const [open, setOpen]               = useState(false);
-  const wrapperRef                    = useRef<HTMLDivElement>(null);
-  const debounceRef                   = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => {
-    function handleClick(e: MouseEvent) {
-      if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    }
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, []);
-
-  async function loadSuggestions(q: string) {
-    setLoading(true);
-    try {
-      const vals = await fetchColumnValues(table, column, q || undefined);
-      setSuggestions(vals);
-      setOpen(vals.length > 0);
-    } catch {
-      setSuggestions([]);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function handleChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const q = e.target.value;
-    onChange(q);
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => loadSuggestions(q), 250);
-  }
-
-  function handleFocus() { loadSuggestions(value); }
-
-  function handleSelect(val: string) {
-    onChange(val);
-    setOpen(false);
-    setSuggestions([]);
-  }
-
-  return (
-    <div ref={wrapperRef} className="relative">
-      <div className="relative">
-        <input
-          type="text"
-          value={value}
-          onChange={handleChange}
-          onFocus={handleFocus}
-          placeholder="= value"
-          className="w-36 px-2.5 py-1.5 pr-7 text-sm rounded-lg border border-gray-200 dark:border-gray-700
-                     bg-white dark:bg-gray-800 text-gray-900 dark:text-white
-                     placeholder-gray-300 dark:placeholder-gray-600
-                     focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent
-                     transition-shadow"
-        />
-        {loading ? (
-          <Loader2 size={11} className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 animate-spin pointer-events-none" />
-        ) : value ? (
-          <button
-            onMouseDown={(e) => { e.preventDefault(); onChange(''); setOpen(false); }}
-            className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-300 hover:text-gray-500 dark:hover:text-gray-300"
-          >
-            <X size={11} />
-          </button>
-        ) : null}
-      </div>
-
-      {open && suggestions.length > 0 && (
-        <ul className="absolute z-50 top-full mt-1 left-0 w-48 max-h-52 overflow-y-auto
-                       bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700
-                       rounded-lg shadow-lg shadow-black/10 dark:shadow-black/40 py-1">
-          {suggestions.map((val) => (
-            <li key={val}>
-              <button
-                onMouseDown={(e) => { e.preventDefault(); handleSelect(val); }}
-                className={`w-full text-left px-3 py-1.5 text-sm truncate transition-colors
-                            ${val === value
-                              ? 'bg-brand-50 dark:bg-brand-900/30 text-brand-700 dark:text-brand-300'
-                              : 'text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700'}`}
-                title={val}
-              >
-                {val}
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-}
 
 
 # ============================================================
@@ -557,10 +375,10 @@ export default function TableView({ table }: TableViewProps) {
                 ? `${data.total.toLocaleString()} rows${searchTerm ? ` matching "${searchTerm}"` : ''}`
                 : `${table.row_count.toLocaleString()} rows`}
             </span>
-            {table.latest_date && (
+            {(data?.latest_date ?? table.latest_date) && (
               <>
                 <span className="text-gray-200 dark:text-gray-700">·</span>
-                <span>latest <span className="text-gray-500 dark:text-gray-400">{table.latest_date}</span></span>
+                <span>latest <span className="text-gray-500 dark:text-gray-400">{data?.latest_date ?? table.latest_date}</span></span>
               </>
             )}
           </p>
@@ -767,9 +585,3 @@ function PagBtn({ children, onClick, disabled, label }: {
     </button>
   );
 }
-
-
-# ============================================================
-# frontend/src/components/Sidebar.tsx  (unchanged)
-# frontend/src/index.css               (unchanged)
-# ============================================================
