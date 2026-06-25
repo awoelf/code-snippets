@@ -933,3 +933,23 @@ function PagBtn({ children, onClick, disabled, label }: {
     </button>
   );
 }
+
+
+import asyncio
+
+async def _refresh_db_loop():
+    while True:
+        await asyncio.sleep(3600)  # 1 hour
+        try:
+            if settings.USE_S3:
+                download_db_from_s3(settings.S3_BUCKET, settings.S3_KEY, settings.DB_PATH)
+                log.info("DB refreshed from S3.")
+        except Exception as e:
+            log.error("DB refresh failed: %s", e)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ... existing startup download ...
+    task = asyncio.create_task(_refresh_db_loop())
+    yield
+    task.cancel()
