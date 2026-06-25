@@ -1,0 +1,122 @@
+import axios from 'axios';
+import { PagedResponse, TableMeta } from '@/types';
+
+// ── Config from environment variables ────────────────────────────────────────
+const API_ENDPOINT = import.meta.env.VITE_API_ENDPOINT as string;
+const API_KEY      = import.meta.env.VITE_API_KEY as string;
+
+if (!API_ENDPOINT || !API_KEY) {
+  console.error('Missing VITE_API_ENDPOINT or VITE_API_KEY in .env');
+}
+
+// ── Axios instance ────────────────────────────────────────────────────────────
+const client = axios.create({
+  baseURL: API_ENDPOINT.replace(/\/$/, ''),
+  headers: { 'X-API-Key': API_KEY },
+  timeout: 15_000,
+});
+
+// ── Login password (frontend-only, stored in sessionStorage) ─────────────────
+const AUTH_KEY = 'data_explorer_auth';
+
+export function saveAuth(): void {
+  sessionStorage.setItem(AUTH_KEY, 'true');
+}
+
+export function isAuthenticated(): boolean {
+  return sessionStorage.getItem(AUTH_KEY) === 'true';
+}
+
+export function clearAuth(): void {
+  sessionStorage.removeItem(AUTH_KEY);
+}
+
+export function checkLoginPassword(input: string): boolean {
+  const expected = import.meta.env.VITE_LOGIN_PASSWORD as string;
+  return input === expected;
+}
+
+// ── API calls ─────────────────────────────────────────────────────────────────
+
+export async function validateConnection(): Promise<void> {
+  await client.get('/health');
+  await client.get('/api/tables');
+}
+
+export async function fetchTables(): Promise<TableMeta[]> {
+  const { data } = await client.get<TableMeta[]>('/api/tables');
+  return data;
+}
+
+export async function fetchRows(
+  table: string,
+  params: Record<string, string | number>,
+): Promise<PagedResponse> {
+  const { data } = await client.get<PagedResponse>(`/api/${table}`, { params });
+  return data;
+}
+
+export async function searchRows(
+  table: string,
+  params: Record<string, string | number>,
+): Promise<PagedResponse> {
+  const { data } = await client.get<PagedResponse>(`/api/${table}/search`, { params });
+  return data;
+}
+
+export async function fetchAllRows(
+  table: string,
+  maxRows = 50_000,
+): Promise<Record<string, unknown>[]> {
+  const PAGE_SIZE = 500;
+  const params: Record<string, string | number> = { page: 1, page_size: PAGE_SIZE };
+  if (searchTerm) params.q = searchTerm;
+  const fn = searchTerm ? searchRows : fetchRows;
+
+  // Fetch first page to get total count
+  const first = await fn(table, params);
+  const items = [...first.items];
+
+  // Fetch remaining pages sequentially — avoids flooding browser with parallel requests
+  for (let pg = 2; pg <= first.pages; pg++) {
+    if (items.length >= maxRows) break;
+    const result = await fn(table, { ...params, page: pg });
+    items.push(...result.items);
+  }
+
+  return items.slice(0, maxRows);
+}
+): Promise<Record<string, unknown>[]> {
+  const MAX = 1000;
+  const params: Record<string, string | number> = { page: 1, page_size: MAX };
+  if (searchTerm) params.q = searchTerm;
+
+  const fn = searchTerm ? searchRows : fetchRows;
+  const first = await fn(table, params);
+  const items = [...first.items];
+
+  if (first.pages > 1) {
+    const rest = await Promise.all(
+      Array.from({ length: first.pages - 1 }, (_, i) =>
+        fn(table, { ...params, page: i + 2 }),
+      ),
+    );
+    rest.forEach((r) => items.push(...r.items));
+  }
+
+  return items;
+}
+
+export async function fetchColumnValues(
+  table: string,
+  column: string,
+  q?: string,
+): Promise<string[]> {
+  const params: Record<string, string> = {};
+  if (q) params.q = q;
+  const { data } = await client.get<{ column: string; values: string[] }>(
+    `/api/${table}/values/${column}`,
+    { params },
+  );
+  return data.values;
+}
