@@ -1,3 +1,171 @@
+"""
+Entry point.
+
+  python main.py            # dev  (reads ENV from .env)
+  ENV=prod python main.py   # prod (downloads DB from S3 first)
+"""
+import asyncio
+import logging
+import os
+import tempfile
+from contextlib import asynccontextmanager
+
+import uvicorn
+from fastapi import FastAPI, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from config import settings
+from database import DB_REGISTRY, download_db_from_s3, get_connection
+from routers import router
+
+logging.basicConfig(
+    level=logging.DEBUG if settings.is_dev else logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s – %(message)s",
+)
+log = logging.getLogger(__name__)
+
+
+# ── S3 refresh helpers ────────────────────────────────────────────────────────
+
+def _download_to_dest_atomic(bucket: str, key: str, dest_path: str) -> None:
+    """
+    Download to a temp file on the same filesystem, then atomically swap.
+    os.replace() is atomic on POSIX when src and dest are on the same volume,
+    so in-flight SQLite reads never see a half-written file.
+    """
+    dest_dir = os.path.dirname(os.path.abspath(dest_path)) or "."
+    fd, tmp_path = tempfile.mkstemp(suffix=".db", dir=dest_dir)
+    os.close(fd)
+    try:
+        download_db_from_s3(bucket=bucket, key=key, dest_path=tmp_path)
+        os.replace(tmp_path, dest_path)  # atomic swap
+        log.info("DB refreshed from s3://%s/%s", bucket, key)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+async def _refresh_db_loop():
+    """Background task: re-download the DB from S3 every REFRESH_INTERVAL_SECONDS."""
+    interval = settings.REFRESH_INTERVAL_SECONDS
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            # Run the blocking S3 download in a thread so the event loop stays free
+            await asyncio.to_thread(
+                _download_to_dest_atomic,
+                settings.S3_BUCKET,
+                settings.S3_KEY,
+                settings.DB_PATH,
+            )
+        except asyncio.CancelledError:
+            log.info("DB refresh loop cancelled.")
+            break
+        except Exception as e:
+            log.error("Scheduled DB refresh failed: %s", e)
+            # keep looping — try again next interval
+
+
+# ── Lifespan ──────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    refresh_task = None
+
+    # ── Initial download of DB from S3 (prod) ─────────────────────────────────
+    if settings.USE_S3:
+        if not settings.S3_BUCKET or not settings.S3_KEY:
+            raise RuntimeError(
+                "USE_S3=true but S3_BUCKET and/or S3_KEY are not set in .env"
+            )
+        _download_to_dest_atomic(settings.S3_BUCKET, settings.S3_KEY, settings.DB_PATH)
+    else:
+        log.info("USE_S3=false — using local DB at %s", settings.DB_PATH)
+
+    # ── Verify every registered DB is reachable ───────────────────────────────
+    for db_key, db_path in DB_REGISTRY.items():
+        conn = get_connection(db_key)
+        try:
+            conn.execute("SELECT 1")
+            log.info("DB '%s' (%s) connected.", db_key, db_path)
+        finally:
+            conn.close()
+
+    # ── Start hourly refresh loop (prod + S3 only) ────────────────────────────
+    if settings.USE_S3 and settings.REFRESH_INTERVAL_SECONDS > 0:
+        refresh_task = asyncio.create_task(_refresh_db_loop())
+        log.info(
+            "Started DB refresh loop — every %s seconds.",
+            settings.REFRESH_INTERVAL_SECONDS,
+        )
+
+    yield
+
+    # ── Shutdown ──────────────────────────────────────────────────────────────
+    if refresh_task:
+        refresh_task.cancel()
+        try:
+            await refresh_task
+        except asyncio.CancelledError:
+            pass
+    log.info("Shutting down.")
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title=settings.API_TITLE,
+        description=settings.API_DESCRIPTION,
+        version=settings.API_VERSION,
+        docs_url="/docs" if settings.SHOW_DOCS else None,
+        redoc_url="/redoc" if settings.SHOW_DOCS else None,
+        openapi_url="/openapi.json",
+        lifespan=lifespan,
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.CORS_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["GET", "OPTIONS"],
+        allow_headers=["*"],
+    )
+
+    @app.exception_handler(Exception)
+    async def _unhandled(request: Request, exc: Exception):
+        log.exception("Unhandled error: %s", exc)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "Internal server error."},
+        )
+
+    @app.get("/health", tags=["system"], summary="Health check")
+    def health():
+        return {"status": "ok", "env": settings.ENV, "version": settings.API_VERSION}
+
+    app.include_router(router, prefix=settings.API_PREFIX)
+
+    log.info(
+        "Starting %s v%s [%s] on %s:%s",
+        settings.API_TITLE, settings.API_VERSION,
+        settings.ENV, settings.HOST, settings.PORT,
+    )
+    return app
+
+
+app = create_app()
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host=settings.HOST,
+        port=settings.PORT,
+        reload=settings.is_dev,
+        log_level="debug" if settings.is_dev else "info",
+    )
+
+
 import axios from 'axios';
 import { PagedResponse, TableMeta } from '@/types';
 
