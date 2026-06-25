@@ -459,3 +459,477 @@ function PagBtn({ children, onClick, disabled, label }: {
     </button>
   );
 }
+
+
+# ============================================================
+# frontend/src/api/client.ts
+# ============================================================
+import axios from 'axios';
+import { PagedResponse, TableMeta } from '@/types';
+
+// ── Config from environment variables ────────────────────────────────────────
+const API_ENDPOINT = import.meta.env.VITE_API_ENDPOINT as string;
+const API_KEY      = import.meta.env.VITE_API_KEY as string;
+
+if (!API_ENDPOINT || !API_KEY) {
+  console.error('Missing VITE_API_ENDPOINT or VITE_API_KEY in .env');
+}
+
+// ── Axios instance ────────────────────────────────────────────────────────────
+const client = axios.create({
+  baseURL: API_ENDPOINT.replace(/\/$/, ''),
+  headers: { 'X-API-Key': API_KEY },
+  timeout: 15_000,
+});
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+const AUTH_KEY = 'data_explorer_auth';
+
+export function saveAuth(): void { sessionStorage.setItem(AUTH_KEY, 'true'); }
+export function isAuthenticated(): boolean { return sessionStorage.getItem(AUTH_KEY) === 'true'; }
+export function clearAuth(): void { sessionStorage.removeItem(AUTH_KEY); }
+
+export function checkLoginPassword(input: string): boolean {
+  const expected = import.meta.env.VITE_LOGIN_PASSWORD as string;
+  return input === expected;
+}
+
+// ── API calls ─────────────────────────────────────────────────────────────────
+
+export async function validateConnection(): Promise<void> {
+  await client.get('/health');
+  await client.get('/api/tables');
+}
+
+export async function fetchTables(): Promise<TableMeta[]> {
+  const { data } = await client.get<TableMeta[]>('/api/tables');
+  return data;
+}
+
+export async function fetchRows(
+  table: string,
+  params: Record<string, string | number>,
+): Promise<PagedResponse> {
+  const { data } = await client.get<PagedResponse>(`/api/${table}`, { params });
+  return data;
+}
+
+export async function searchRows(
+  table: string,
+  params: Record<string, string | number>,
+): Promise<PagedResponse> {
+  const { data } = await client.get<PagedResponse>(`/api/${table}/search`, { params });
+  return data;
+}
+
+export async function fetchAllRows(
+  table: string,
+  params: Record<string, string | number>,
+  maxRows = 50_000,
+  onProgress?: (fetched: number, total: number) => void,
+): Promise<Record<string, unknown>[]> {
+  const PAGE_SIZE = 5_000;
+  const hasSearch = Object.prototype.hasOwnProperty.call(params, 'q') && Boolean(params['q']);
+  const fn = hasSearch ? searchRows : fetchRows;
+  const pageParams: Record<string, string | number> = { ...params, page: 1, page_size: PAGE_SIZE };
+
+  const first = await fn(table, pageParams);
+  const items: Record<string, unknown>[] = [...first.items];
+  onProgress?.(items.length, first.total);
+
+  for (let pg = 2; pg <= first.pages; pg++) {
+    if (items.length >= maxRows) break;
+    const result = await fn(table, { ...pageParams, page: pg });
+    items.push(...result.items);
+    onProgress?.(Math.min(items.length, maxRows), first.total);
+  }
+
+  return items.slice(0, maxRows);
+}
+
+export async function fetchColumnValues(
+  table: string,
+  column: string,
+  q?: string,
+): Promise<string[]> {
+  const params: Record<string, string> = {};
+  if (q) params.q = q;
+  const { data } = await client.get<{ column: string; values: string[] }>(
+    `/api/${table}/values/${column}`,
+    { params },
+  );
+  return data.values;
+}
+
+# ============================================================
+# frontend/src/components/TableView.tsx
+# ============================================================
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  ArrowUpDown, ChevronDown, ChevronLeft, ChevronRight,
+  ChevronsLeft, ChevronsRight, ChevronUp, Download,
+  Filter, Loader2, Search, SlidersHorizontal, X,
+} from 'lucide-react';
+import { fetchAllRows, fetchRows, searchRows } from '@/api/client';
+import { exportToXlsx } from '@/api/export';
+import { PagedResponse, TableMeta } from '@/types';
+import FilterInput from '@/components/FilterInput';
+
+interface TableViewProps {
+  table: TableMeta;
+}
+
+interface FilterState {
+  [col: string]: string;
+}
+
+type SortDir = 'asc' | 'desc';
+
+const PAGE_SIZE = 50;
+const DEBOUNCE_MS = 350;
+
+export default function TableView({ table }: TableViewProps) {
+  const [data, setData]           = useState<PagedResponse | null>(null);
+  const [loading, setLoading]     = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState('');
+  const [error, setError]         = useState('');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [page, setPage]           = useState(1);
+  const [sortBy, setSortBy]       = useState<string | null>(null);
+  const [sortDir, setSortDir]     = useState<SortDir>('asc');
+  const [filters, setFilters]     = useState<FilterState>({});
+  const [showFilters, setShowFilters] = useState(false);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const filterableCols = (table as TableMeta & { filterable_columns?: string[] }).filterable_columns ?? [];
+  const hasSearch  = table.searchable_columns.length > 0;
+  const hasFilters = filterableCols.length > 0;
+
+  // Build params object for API calls
+  function buildParams(pg: number): Record<string, string | number> {
+    const params: Record<string, string | number> = { page: pg, page_size: PAGE_SIZE };
+    if (searchTerm) params.q = searchTerm;
+    if (sortBy) { params.sort_by = sortBy; params.sort_dir = sortDir; }
+    Object.entries(filters).forEach(([k, v]) => { if (v.trim()) params[k] = v.trim(); });
+    return params;
+  }
+
+  const load = useCallback(async (pg: number) => {
+    setLoading(true);
+    setError('');
+    try {
+      const params = buildParams(pg);
+      const result = searchTerm
+        ? await searchRows(table.name, params)
+        : await fetchRows(table.name, params);
+      setData(result);
+    } catch (e: unknown) {
+      setError((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'Failed to load data.');
+    } finally {
+      setLoading(false);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [table.name, searchTerm, sortBy, sortDir, filters]);
+
+  // Reset when table changes
+  useEffect(() => {
+    setSearchTerm(''); setPage(1); setData(null);
+    setSortBy(null); setSortDir('asc'); setFilters({});
+    setShowFilters(false);
+  }, [table.name]);
+
+  // Load on any dependency change (debounced for search)
+  useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => { setPage(1); load(1); }, DEBOUNCE_MS);
+    return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchTerm, sortBy, sortDir, filters, table.name]);
+
+  function handlePageChange(pg: number) { setPage(pg); load(pg); }
+
+  function handleSort(col: string) {
+    if (sortBy === col) {
+      setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortBy(col);
+      setSortDir('asc');
+    }
+  }
+
+  function handleFilterChange(col: string, val: string) {
+    setFilters((prev) => ({ ...prev, [col]: val }));
+  }
+
+  function clearFilters() {
+    setFilters({});
+  }
+
+  const activeFilterCount = Object.values(filters).filter((v) => v.trim()).length;
+
+  async function handleExport() {
+    setExporting(true);
+    setExportProgress('');
+    try {
+      const rows = await fetchAllRows(
+        table.name,
+        buildParams(1),
+        50_000,
+        (fetched, total) => setExportProgress(`${fetched.toLocaleString()} / ${total.toLocaleString()}`),
+      );
+      setExportProgress('Writing file…');
+      exportToXlsx(rows, table.name);
+    } catch { setError('Export failed.'); }
+    finally { setExporting(false); setExportProgress(''); }
+  }
+
+  const columns = table.columns.filter((c) => c !== 'id');
+
+  // Use backend-computed MAX("dqs-date") which covers all filtered rows, not just current page.
+  // When data is loaded use data.latest_date; only fall back to table.latest_date before first load.
+  const latestDate = data !== null ? data.latest_date : table.latest_date;
+
+  return (
+    <div className="flex flex-col h-full min-w-0">
+
+      {/* ── Toolbar ── */}
+      <div className="flex items-center gap-2 px-6 py-3 border-b border-gray-100 dark:border-gray-800 shrink-0 flex-wrap">
+        {/* Title */}
+        <div className="flex-1 min-w-0 mr-2">
+          <h2 className="text-base font-semibold text-gray-900 dark:text-white tracking-tight truncate">{table.name}</h2>
+          <p className="text-xs text-gray-400 dark:text-gray-600 font-mono mt-0.5 flex items-center gap-2">
+            <span>
+              {data
+                ? `${data.total.toLocaleString()} rows${searchTerm ? ` matching "${searchTerm}"` : ''}`
+                : `${table.row_count.toLocaleString()} rows`}
+            </span>
+            {latestDate && (
+              <>
+                <span className="text-gray-200 dark:text-gray-700">·</span>
+                <span>latest <span className="text-gray-500 dark:text-gray-400">{latestDate}</span></span>
+              </>
+            )}
+          </p>
+        </div>
+
+        {/* Search */}
+        {hasSearch && (
+          <div className="relative w-56">
+            <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 dark:text-gray-600 pointer-events-none" />
+            <input
+              type="search"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              placeholder={`Search…`}
+              className="w-full pl-8 pr-7 py-1.5 text-sm rounded-lg border border-gray-200 dark:border-gray-700
+                         bg-gray-50 dark:bg-gray-800 text-gray-900 dark:text-white
+                         placeholder-gray-400 dark:placeholder-gray-600
+                         focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent transition-shadow"
+            />
+            {searchTerm && (
+              <button onClick={() => setSearchTerm('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
+                <X size={12} />
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Filter toggle */}
+        {hasFilters && (
+          <button
+            onClick={() => setShowFilters((s) => !s)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-lg border transition-colors
+                        ${showFilters || activeFilterCount > 0
+                          ? 'border-brand-300 dark:border-brand-700 bg-brand-50 dark:bg-brand-900/30 text-brand-700 dark:text-brand-300'
+                          : 'border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800'}`}
+          >
+            <SlidersHorizontal size={13} />
+            Filters
+            {activeFilterCount > 0 && (
+              <span className="ml-0.5 inline-flex items-center justify-center w-4 h-4 rounded-full
+                               bg-brand-600 text-white text-[10px] font-bold">
+                {activeFilterCount}
+              </span>
+            )}
+            {showFilters ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+          </button>
+        )}
+
+        {/* Export */}
+        <button
+          onClick={handleExport}
+          disabled={exporting || loading || !data?.items.length}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-lg
+                     border border-gray-200 dark:border-gray-700
+                     text-gray-600 dark:text-gray-400
+                     hover:bg-gray-50 dark:hover:bg-gray-800 hover:text-gray-900 dark:hover:text-white
+                     disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        >
+          {exporting ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+          {exporting && exportProgress ? exportProgress : 'Export .xlsx'}
+        </button>
+      </div>
+
+      {/* ── Filter panel ── */}
+      {showFilters && hasFilters && (
+        <div className="px-6 py-3 border-b border-gray-100 dark:border-gray-800 bg-gray-50/60 dark:bg-gray-900/40 shrink-0">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
+              <Filter size={11} /> Column Filters
+            </span>
+            {activeFilterCount > 0 && (
+              <button onClick={clearFilters}
+                className="text-xs text-red-500 dark:text-red-400 hover:underline flex items-center gap-1">
+                <X size={11} /> Clear all
+              </button>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {filterableCols.map((col) => (
+              <div key={col} className="flex flex-col gap-1">
+                <label className="text-[10px] font-mono font-medium text-gray-400 dark:text-gray-600 uppercase tracking-wider">
+                  {col}
+                </label>
+                <FilterInput
+                  table={table.name}
+                  column={col}
+                  value={filters[col] ?? ''}
+                  onChange={(val) => handleFilterChange(col, val)}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── Error ── */}
+      {error && (
+        <div className="mx-6 mt-3 px-4 py-3 rounded-lg bg-red-50 dark:bg-red-950/40
+                        border border-red-200 dark:border-red-800 text-sm text-red-600 dark:text-red-400 shrink-0">
+          {error}
+        </div>
+      )}
+
+      {/* ── Table (scrollable both axes) ── */}
+      <div className="flex-1 overflow-auto px-6 py-4">
+        {loading && !data ? (
+          <div className="flex items-center justify-center h-40 gap-2 text-gray-400 dark:text-gray-600">
+            <Loader2 size={18} className="animate-spin" /><span className="text-sm">Loading…</span>
+          </div>
+        ) : data?.items.length === 0 ? (
+          <div className="flex items-center justify-center h-40 text-sm text-gray-400 dark:text-gray-600">
+            No results{searchTerm ? ` for "${searchTerm}"` : ''}.
+          </div>
+        ) : (
+          <div className="relative rounded-xl border border-gray-100 dark:border-gray-800 shadow-sm">
+            {/* Loading overlay */}
+            {loading && (
+              <div className="absolute inset-0 bg-white/60 dark:bg-gray-950/60 z-10 flex items-center justify-center rounded-xl">
+                <Loader2 size={20} className="animate-spin text-brand-500" />
+              </div>
+            )}
+
+            {/* Horizontally scrollable wrapper */}
+            <div className="overflow-x-auto">
+              <table className="w-max min-w-full text-sm border-collapse">
+                <thead>
+                  <tr className="bg-gray-50 dark:bg-gray-800/60">
+                    {columns.map((col) => {
+                      const isSorted = sortBy === col;
+                      return (
+                        <th
+                          key={col}
+                          onClick={() => handleSort(col)}
+                          className="text-left px-4 py-3 text-xs font-semibold text-gray-500 dark:text-gray-400
+                                     uppercase tracking-wider whitespace-nowrap border-b border-gray-100 dark:border-gray-800
+                                     font-mono cursor-pointer select-none
+                                     hover:bg-gray-100 dark:hover:bg-gray-700/60 hover:text-gray-700 dark:hover:text-gray-200
+                                     transition-colors group"
+                        >
+                          <span className="flex items-center gap-1.5">
+                            {col}
+                            {isSorted ? (
+                              sortDir === 'asc'
+                                ? <ChevronUp size={12} className="text-brand-500" />
+                                : <ChevronDown size={12} className="text-brand-500" />
+                            ) : (
+                              <ArrowUpDown size={11} className="text-gray-300 dark:text-gray-700 group-hover:text-gray-400 dark:group-hover:text-gray-500" />
+                            )}
+                          </span>
+                        </th>
+                      );
+                    })}
+                  </tr>
+                </thead>
+                <tbody>
+                  {(data?.items ?? []).map((row, i) => (
+                    <tr key={i}
+                      className="border-b border-gray-50 dark:border-gray-800/60
+                                 hover:bg-brand-50/50 dark:hover:bg-brand-900/10 transition-colors">
+                      {columns.map((col) => {
+                        const val = (row as Record<string, unknown>)[col];
+                        return (
+                          <td key={col} className="px-4 py-2.5 text-gray-700 dark:text-gray-300 whitespace-nowrap">
+                            {val === null || val === undefined ? (
+                              <span className="text-gray-300 dark:text-gray-700 font-mono text-xs">null</span>
+                            ) : typeof val === 'boolean' ? (
+                              <span className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium
+                                ${val ? 'bg-green-50 text-green-700 dark:bg-green-900/30 dark:text-green-400'
+                                      : 'bg-red-50 text-red-600 dark:bg-red-900/30 dark:text-red-400'}`}>
+                                {val ? 'true' : 'false'}
+                              </span>
+                            ) : typeof val === 'number' ? (
+                              <span className="font-mono text-brand-600 dark:text-brand-400">{val.toLocaleString()}</span>
+                            ) : String(val).match(/^\d{4}-\d{2}-\d{2}/) ? (
+                              <span className="text-gray-500 dark:text-gray-500 font-mono text-xs">
+                                {String(val).slice(0, 19).replace('T', ' ')}
+                              </span>
+                            ) : (
+                              <span className="max-w-xs block truncate" title={String(val)}>{String(val)}</span>
+                            )}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── Pagination ── */}
+      {data && data.pages > 1 && (
+        <div className="flex items-center justify-between px-6 py-3
+                        border-t border-gray-100 dark:border-gray-800 shrink-0">
+          <span className="text-xs text-gray-400 dark:text-gray-600">
+            Page {data.page} of {data.pages} — {data.total.toLocaleString()} rows
+          </span>
+          <div className="flex items-center gap-1">
+            <PagBtn onClick={() => handlePageChange(1)} disabled={page === 1} label="First"><ChevronsLeft size={14} /></PagBtn>
+            <PagBtn onClick={() => handlePageChange(page - 1)} disabled={page === 1} label="Prev"><ChevronLeft size={14} /></PagBtn>
+            <span className="px-3 py-1 text-xs font-mono text-gray-600 dark:text-gray-400">{page}</span>
+            <PagBtn onClick={() => handlePageChange(page + 1)} disabled={page >= data.pages} label="Next"><ChevronRight size={14} /></PagBtn>
+            <PagBtn onClick={() => handlePageChange(data.pages)} disabled={page >= data.pages} label="Last"><ChevronsRight size={14} /></PagBtn>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PagBtn({ children, onClick, disabled, label }: {
+  children: React.ReactNode; onClick: () => void; disabled: boolean; label: string;
+}) {
+  return (
+    <button onClick={onClick} disabled={disabled} aria-label={label}
+      className="p-1.5 rounded text-gray-400 dark:text-gray-600
+                 hover:bg-gray-100 dark:hover:bg-gray-800 hover:text-gray-700 dark:hover:text-gray-300
+                 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
+      {children}
+    </button>
+  );
+}
